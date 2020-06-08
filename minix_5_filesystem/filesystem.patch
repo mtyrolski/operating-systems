@@ -1,0 +1,187 @@
+diff -rupN ori/usr/src/minix/fs/mfs/const.h moj/usr/src/minix/fs/mfs/const.h
+--- ori/usr/src/minix/fs/mfs/const.h	2020-05-25 18:51:43.167941988 +0200
++++ moj/usr/src/minix/fs/mfs/const.h	2020-05-26 00:33:47.348139165 +0200
+@@ -81,5 +81,8 @@
+ 
+ #define NUL(str,l,m) mfs_nul_f(__FILE__,__LINE__,(str), (l), (m))
+ 
++/* key constants */
++#define KEY_NAME "KEY"
++#define ENC_NAME "NOT_ENCRYPTED"
+ #endif
+ 
+diff -rupN ori/usr/src/minix/fs/mfs/read.c moj/usr/src/minix/fs/mfs/read.c
+--- ori/usr/src/minix/fs/mfs/read.c	2020-05-25 18:51:43.171942132 +0200
++++ moj/usr/src/minix/fs/mfs/read.c	2020-05-26 23:24:47.741145372 +0200
+@@ -20,6 +20,54 @@ static int rw_chunk(struct inode *rip, u
+ 	buf_off, unsigned int block_size, int *completed);
+ 
+ 
++
++#define cmpn(fst, snd) fst->i_num == snd
++
++#define SO_WRITE 0
++#define SO_READ 1
++
++#define SO_KEY 0
++#define SO_INIT 1
++#define SO_DELTA 2
++
++unsigned char touch_enc(int enc_var, int read, unsigned char value) {
++  static unsigned char _key = '\x0';
++  static _Bool _inited = 0;
++  static unsigned char _delta = 0;
++
++  switch(enc_var) {
++    case SO_KEY:
++      {
++        if(!read) {
++          _key = value;
++        }
++        return _key;
++        break;
++      }
++    case SO_INIT:
++      {
++        if(!read) {
++          _inited = (int)value;
++        }
++
++        return _inited;
++        break;
++      }
++    case SO_DELTA:
++      {
++        if(!read) {
++          _delta = value;
++        }
++
++        return _delta;
++        break;
++      }
++      default:
++        return (unsigned char)0x1;  
++  }
++}
++
++
+ /*===========================================================================*
+  *				fs_readwrite				     *
+  *===========================================================================*/
+@@ -67,6 +115,47 @@ int fs_readwrite(void)
+ 
+   lmfs_reset_rdwt_err();
+ 
++  ino_t eip;
++  ino_t kip;
++
++  int eip_r, kip_r; // if eip/eip exists
++  eip_r = search_dir(find_inode(fs_dev, ROOT_INODE), ENC_NAME, &eip, LOOK_UP, IGN_PERM);
++  kip_r = search_dir(find_inode(fs_dev, ROOT_INODE), KEY_NAME, &kip, LOOK_UP, IGN_PERM);
++
++  if(eip_r != OK) {
++    // not encrypted mode
++    if(kip_r == OK && cmpn(rip, kip)) {
++        if(rw_flag == READING) {
++          return EPERM;
++        }else if(rw_flag == WRITING) {
++          if(nrbytes != 1) {
++            return EINVAL;
++          }
++          // updating key in use of only 1 byte
++          char c;
++          sys_safecopyfrom(VFS_PROC_NR, gid,
++                              (vir_bytes) 0, (vir_bytes) (&c), (size_t) 1);
++          touch_enc(SO_KEY, SO_WRITE, (unsigned char)c);
++          touch_enc(SO_INIT, SO_WRITE, (unsigned char)1);
++          position += 1; //only one byte
++          fs_m_out.m_fs_vfs_readwrite.seek_pos = position;
++          fs_m_out.m_fs_vfs_readwrite.nbytes = 1;
++          return 0;
++        }
++      }
++    
++    if(!touch_enc(SO_INIT, SO_READ, (unsigned char)0)) {
++      return EPERM;
++    }
++    touch_enc(SO_DELTA, SO_WRITE, touch_enc(SO_KEY, SO_READ, (unsigned char)0));
++  }else {
++    // encryption mode
++    touch_enc(SO_DELTA, SO_WRITE, (unsigned char)0);
++    if(cmpn(rip, kip)) {
++      return EPERM;
++    }
++  }
++  
+   /* If this is file i/o, check we can write */
+   if (rw_flag == WRITING && !block_spec) {
+   	  if(rip->i_sp->s_rd_only) 
+@@ -87,7 +176,7 @@ int fs_readwrite(void)
+   if(block_spec && rw_flag == WRITING &&
+   	(dev_t) rip->i_zone[0] == superblock.s_dev && superblock.s_rd_only)
+ 		return EROFS;
+-	      
++
+   cum_io = 0;
+   /* Split the transfer into chunks that don't span two blocks. */
+   while (nrbytes > 0) {
+@@ -210,7 +299,6 @@ int fs_breadwrite(void)
+   return(r);
+ }
+ 
+-
+ /*===========================================================================*
+  *				rw_chunk				     *
+  *===========================================================================*/
+@@ -227,8 +315,8 @@ unsigned buf_off;		/* offset in grant */
+ unsigned int block_size;	/* block size of FS operating on */
+ int *completed;			/* number of bytes copied */
+ {
+-/* Read or write (part of) a block. */
+ 
++/* Read or write (part of) a block. */
+   register struct buf *bp = NULL;
+   register int r = OK;
+   int n, block_spec;
+@@ -263,7 +351,7 @@ int *completed;			/* number of bytes cop
+ 	if (rw_flag == READING) {
+ 		/* Reading from a nonexistent block.  Must read as all zeros.*/
+ 		r = sys_safememset(VFS_PROC_NR, gid, (vir_bytes) buf_off,
+-			   0, (size_t) chunk);
++			   (int)touch_enc(SO_DELTA, SO_READ, (unsigned char)0), (size_t) chunk);
+ 		if(r != OK) {
+ 			printf("MFS: sys_safememset failed\n");
+ 		}
+@@ -304,14 +392,31 @@ int *completed;			/* number of bytes cop
+ 	zero_block(bp);
+   }
+ 
++  int delta = touch_enc(SO_DELTA, SO_READ, 0); 
++  char* msg = b_data(bp) + off;
++
+   if (rw_flag == READING) {
++	  if(delta!=0)
++      for(int j = 0; j < chunk; ++j){
++         msg[j] = ((unsigned char)msg[j] - delta);
++      }
+ 	/* Copy a chunk from the block buffer to user space. */
+ 	r = sys_safecopyto(VFS_PROC_NR, gid, (vir_bytes) buf_off,
+ 			   (vir_bytes) (b_data(bp)+off), (size_t) chunk);
++
++    if(delta!=0)
++      for(int j = 0; j < chunk; ++j) 
++         msg[j] = ((unsigned char)msg[j] + delta);
+   } else if(rw_flag == WRITING) {
+-	/* Copy a chunk from user space to the block buffer. */
++	/* Copy a chunk from user space to the block buffer. */ 
+ 	r = sys_safecopyfrom(VFS_PROC_NR, gid, (vir_bytes) buf_off,
+ 			     (vir_bytes) (b_data(bp)+off), (size_t) chunk);
++
++  if(delta != 0) {
++      for(int j = 0; j < chunk; ++j) {
++         msg[j] = ((unsigned char)msg[j] + delta);
++      }
++  }
+ 	MARKDIRTY(bp);
+   }
+   
